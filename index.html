@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Script Lua</title>
+  <style>
+    body {
+      background-color: #1e1e1e; /* fondo oscuro */
+      color: #d4d4d4;           /* texto claro */
+      font-family: monospace;    /* fuente monoespaciada */
+      white-space: pre-wrap;     /* respeta saltos de línea */
+      padding: 20px;
+    }
+    code {
+      display: block;
+      white-space: pre;
+    }
+  </style>
+</head>
+<body>
+<pre><code>
+-- ULDM: ocultar efectos de habilidades (local, reversible)
+-- Pegar como LocalScript en StarterPlayerScripts
+
+local Players        = game:GetService("Players")
+local Lighting       = game:GetService("Lighting")
+local CollectionService = game:GetService("CollectionService")
+local UIS            = game:GetService("UserInputService")
+local TweenService   = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local PerformanceMode = false
+local OriginalStates = {}
+
+-- helpers seguros (pcall)
+local function safeGet(obj, prop)
+	local ok, v = pcall(function() return obj[prop] end)
+	if ok then return v end
+	return nil
+end
+local function safeSet(obj, prop, val)
+	pcall(function() obj[prop] = val end)
+end
+local function safeCall(obj, fnName, ...)
+	pcall(function() if obj[fnName] then obj[fnName](obj, ...) end end)
+end
+
+-- Decide si NO debemos tocar el objeto (protecciones)
+local function isEssential(obj)
+	if not obj or not obj.Parent then return false end
+
+	-- No tocar personajes (jugadores / NPCs con Humanoid)
+	local model = obj:FindFirstAncestorOfClass("Model")
+	if model and model:FindFirstChildOfClass("Humanoid") then
+		return true
+	end
+
+	-- No tocar Highlights (usados por Haki) ni BillboardGui de jugadores
+	if obj:IsA("Highlight") then return true end
+	if obj:IsA("BillboardGui") and obj:FindFirstAncestorWhichIsA("Player") then return true end
+
+	-- Evitar tocar lo que sabemos que es vehículo/boat
+	if obj:IsDescendantOf(workspace:FindFirstChild("Vehicles") or {}) then return true end
+	if obj:FindFirstAncestorWhichIsA("VehicleSeat") then return true end
+
+	-- evitar tocar PlayerGui (UI del jugador) en general para no romper HUDs críticos
+	if obj:IsDescendantOf(player:WaitForChild("PlayerGui")) then return false end -- permitimos optimizar gui del mundo si aparece en workspace
+	-- Nota: si quieres evitar más cosas, agrega checks por nombre o tags.
+
+	return false
+end
+
+-- Guardar estado para restaurar después
+local function saveState(obj)
+	if OriginalStates[obj] then return end
+	local state = {}
+
+	-- comunes
+	state.ClassName = obj.ClassName
+
+	-- BasePart / MeshPart
+	state.LocalTransparencyModifier = safeGet(obj, "LocalTransparencyModifier")
+	state.Material = safeGet(obj, "Material")
+	if obj:IsA("MeshPart") then
+		state.TextureID = safeGet(obj, "TextureID")
+		state.RenderFidelity = safeGet(obj, "RenderFidelity")
+	end
+
+	-- Particle-like
+	if obj:IsA("ParticleEmitter") then
+		state.Enabled = safeGet(obj, "Enabled")
+		state.Texture = safeGet(obj, "Texture") or safeGet(obj, "TextureId")
+		state.Transparency = safeGet(obj, "Transparency")
+		state.Rate = safeGet(obj, "Rate") or safeGet(obj, "EmissionRate")
+		state.Lifetime = safeGet(obj, "Lifetime")
+	end
+
+	if obj:IsA("Trail") then
+		state.Enabled = safeGet(obj, "Enabled")
+		state.Transparency = safeGet(obj, "Transparency")
+		state.Lifetime = safeGet(obj, "Lifetime")
+	end
+
+	if obj:IsA("Beam") then
+		state.Enabled = safeGet(obj, "Enabled")
+		state.Transparency = safeGet(obj, "Transparency")
+	end
+
+	-- Explosion
+	if obj:IsA("Explosion") then
+		state.Visible = safeGet(obj, "Visible")
+		state.BlastPressure = safeGet(obj, "BlastPressure")
+		state.BlastRadius = safeGet(obj, "BlastRadius")
+	end
+
+	-- Lights
+	if obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then
+		state.Enabled = safeGet(obj, "Enabled")
+		state.Range = safeGet(obj, "Range")
+	end
+
+	-- Decal / Texture (GUI textures)
+	if obj:IsA("Decal") or obj:IsA("Texture") then
+		state.Transparency = safeGet(obj, "Transparency")
+		state.Texture = safeGet(obj, "Texture")
+	end
+
+	-- SurfaceGui / BillboardGui
+	if obj:IsA("SurfaceGui") or obj:IsA("BillboardGui") then
+		state.Enabled = safeGet(obj, "Enabled")
+	end
+
+	OriginalStates[obj] = state
+end
+
+-- Hacer "invisible" eficientemente (NO destruir)
+local function makeInvisible(obj)
+	if not obj or isEssential(obj) then return end
+
+	saveState(obj)
+
+	-- Particle emitters
+	if obj:IsA("ParticleEmitter") then
+		-- quitar partículas ya emitidas y evitar nuevas
+		safeCall(obj, "Clear")
+		safeSet(obj, "Enabled", false)
+		pcall(function() obj.Transparency = NumberSequence.new(1) end)
+		pcall(function() obj.Texture = "" end)
+		pcall(function() obj.Rate = 0 end)
+
+	-- Trail
+	elseif obj:IsA("Trail") then
+		safeSet(obj, "Enabled", false)
+		pcall(function() obj.Transparency = NumberSequence.new(1) end)
+		pcall(function() obj.Lifetime = 0 end)
+
+	-- Beam
+	elseif obj:IsA("Beam") then
+		safeSet(obj, "Enabled", false)
+		pcall(function() obj.Transparency = NumberSequence.new(1) end)
+
+	-- Explosions
+	elseif obj:IsA("Explosion") then
+		safeSet(obj, "Visible", false)
+		safeSet(obj, "BlastPressure", 0)
+		safeSet(obj, "BlastRadius", 0)
+
+	-- Decal / Texture
+	elseif obj:IsA("Decal") or obj:IsA("Texture") then
+		-- si está pegado a una parte, la LocalTransparencyModifier la ocultará; si no, ajustamos la transparencia
+		if obj.Parent and obj.Parent:IsA("BasePart") then
+			-- nada: la parte se volverá localmente transparente más abajo
+		else
+			safeSet(obj, "Transparency", 1)
+			pcall(function() obj.Texture = "" end)
+		end
+
+	-- Lights
+	elseif obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then
+		safeSet(obj, "Enabled", false)
+
+	-- SurfaceGui (en la parte) o BillboardGui (no tocamos los de jugadores)
+	elseif obj:IsA("SurfaceGui") then
+		-- ocultar los elementos GUI locales sin destruir
+		for _, g in ipairs(obj:GetDescendants()) do
+			if g:IsA("GuiObject") then
+				pcall(function() g.Visible = false end)
+			end
+		end
+
+	-- MeshPart / BasePart: hacemos invisibles localmente (no rompemos colisiones ni scripts)
+	elseif obj:IsA("MeshPart") or obj:IsA("BasePart") then
+		-- LocalTransparencyModifier es local al cliente: 1 = completamente invisible para TI
+		pcall(function() obj.LocalTransparencyModifier = 1 end)
+		pcall(function() obj.Material = Enum.Material.SmoothPlastic end)
+		if obj:IsA("MeshPart") then
+			pcall(function() obj.RenderFidelity = Enum.RenderFidelity.Performance end)
+			-- NO tocamos TextureID si el objeto es esencial; cambiar TextureID puede afectar
+		end
+	end
+end
+
+-- Restaurar propiedad guardada
+local function restore(obj)
+	local state = OriginalStates[obj]
+	if not state then return end
+
+	-- BasePart / MeshPart
+	if obj:IsA("BasePart") then
+		if state.LocalTransparencyModifier ~= nil then safeSet(obj, "LocalTransparencyModifier", state.LocalTransparencyModifier) end
+		if state.Material ~= nil then safeSet(obj, "Material", state.Material) end
+	end
+	if obj:IsA("MeshPart") then
+		if state.RenderFidelity ~= nil then safeSet(obj, "RenderFidelity", state.RenderFidelity) end
+		if state.TextureID ~= nil then safeSet(obj, "TextureID", state.TextureID) end
+	end
+
+	-- ParticleEmitter
+	if obj:IsA("ParticleEmitter") then
+		if state.Enabled ~= nil then safeSet(obj, "Enabled", state.Enabled) end
+		if state.Transparency ~= nil then pcall(function() obj.Transparency = state.Transparency end) end
+		if state.Texture ~= nil then pcall(function() obj.Texture = state.Texture end) end
+		if state.Rate ~= nil then pcall(function() obj.Rate = state.Rate end) end
+		if state.Lifetime ~= nil then pcall(function() obj.Lifetime = state.Lifetime end) end
+	end
+
+	-- Trail
+	if obj:IsA("Trail") then
+		if state.Enabled ~= nil then safeSet(obj, "Enabled", state.Enabled) end
+		if state.Transparency ~= nil then pcall(function() obj.Transparency = state.Transparency end) end
+		if state.Lifetime ~= nil then pcall(function() obj.Lifetime = state.Lifetime end) end
+	end
+
+	-- Beam
+	if obj:IsA("Beam") then
+		if state.Enabled ~= nil then safeSet(obj, "Enabled", state.Enabled) end
+		if state.Transparency ~= nil then pcall(function() obj.Transparency = state.Transparency end) end
+	end
+
+	-- Explosion
+	if obj:IsA("Explosion") then
+		if state.Visible ~= nil then safeSet(obj, "Visible", state.Visible) end
+		if state.BlastPressure ~= nil then safeSet(obj, "BlastPressure", state.BlastPressure) end
+		if state.BlastRadius ~= nil then safeSet(obj, "BlastRadius", state.BlastRadius) end
+	end
+
+	-- Lights
+	if obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then
+		if state.Enabled ~= nil then safeSet(obj, "Enabled", state.Enabled) end
+		if state.Range ~= nil then safeSet(obj, "Range", state.Range) end
+	end
+
+	-- Decal / Texture
+	if obj:IsA("Decal") or obj:IsA("Texture") then
+		if state.Transparency ~= nil then safeSet(obj, "Transparency", state.Transparency) end
+		if state.Texture ~= nil then pcall(function() obj.Texture = state.Texture end) end
+	end
+
+	-- SurfaceGui / BillboardGui
+	if obj:IsA("SurfaceGui") or obj:IsA("BillboardGui") then
+		if state.Enabled ~= nil then safeSet(obj, "Enabled", state.Enabled) end
+	end
+
+	OriginalStates[obj] = nil
+end
+
+-- Aplicar a todo el juego (con pequeños yields para evitar freeze)
+local function applyToAll(makeFunc)
+	local descendants = game:GetDescendants()
+	for i = 1, #descendants do
+		local o = descendants[i]
+		makeFunc(o)
+		if i % 250 == 0 then task.wait() end
+	end
+end
+
+-- ON: ocultar; OFF: restaurar
+local function setPerformance(on)
+	if on then
+		-- desactivar post-effects
+		pcall(function()
+			Lighting.Brightness = 1
+			Lighting.GlobalShadows = false
+			Lighting.Ambient = Color3.new(0.5,0.5,0.5)
+			for _, e in ipairs(Lighting:GetChildren()) do
+				if e:IsA("PostEffect") then pcall(function() e.Enabled = false end) end
+			end
+		end)
+		applyToAll(makeInvisible)
+	else
+		-- restaurar todo lo que guardamos
+		for obj, _ in pairs(OriginalStates) do
+			if obj and obj.Parent then restore(obj) end
+		end
+	end
+end
+
+-- UI (botón cuadrado)
+local function createToggle()
+	local gui = Instance.new("ScreenGui")
+	gui.ResetOnSpawn = false
+	gui.Name = "ULDM_UI"
+	gui.Parent = player:WaitForChild("PlayerGui")
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(0,200,0,40)
+	label.Position = UDim2.new(0.5,-100,0,20)
+	label.BackgroundTransparency = 0.5
+	label.BackgroundColor3 = Color3.fromRGB(0,0,0)
+	label.TextColor3 = Color3.fromRGB(0,255,0)
+	label.Font = Enum.Font.SourceSansBold
+	label.TextSize = 20
+	label.Text = "ULDM Working"
+	label.Parent = gui
+
+	delay(15, function()
+		local tw = TweenService:Create(label, TweenInfo.new(3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {TextTransparency = 1, BackgroundTransparency = 1})
+		tw:Play()
+		tw.Completed:Connect(function() label:Destroy() end)
+	end)
+
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(0,50,0,50)
+	button.Position = UDim2.new(1,-60,0,20)
+	button.AnchorPoint = Vector2.new(0,0)
+	button.BackgroundColor3 = Color3.fromRGB(170,0,0)
+	button.TextColor3 = Color3.fromRGB(255,255,255)
+	button.Text = "OFF"
+	button.Parent = gui
+
+	button.MouseButton1Click:Connect(function()
+		PerformanceMode = not PerformanceMode
+		if PerformanceMode then
+			button.Text = "ON"
+			button.BackgroundColor3 = Color3.fromRGB(0,170,0)
+			setPerformance(true)
+		else
+			button.Text = "OFF"
+			button.BackgroundColor3 = Color3.fromRGB(170,0,0)
+			setPerformance(false)
+		end
+	end)
+end
+
+-- Procesar objetos nuevos (los limpiamos de inmediato si el modo está activo)
+game.DescendantAdded:Connect(function(obj)
+	if PerformanceMode then
+		-- pequeño delay para esperar que el objeto sea construido
+		task.defer(function()
+			if obj and obj.Parent then
+				makeInvisible(obj)
+				for _, c in ipairs(obj:GetDescendants()) do makeInvisible(c) end
+			end
+		end)
+	end
+end)
+
+-- Tecla F8 para toggle rápido
+UIS.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.KeyCode == Enum.KeyCode.F8 then
+		PerformanceMode = not PerformanceMode
+		setPerformance(PerformanceMode)
+	end
+end)
+
+createToggle()
+print("[ULDM] Script cargado. Usa el botón o F8 para togglear.")
+</code></pre>
+</body>
+</html>
